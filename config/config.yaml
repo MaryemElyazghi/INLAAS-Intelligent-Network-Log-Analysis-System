@@ -1,0 +1,150 @@
+# ============================================================
+# Intelligent Network Log Automation & Analysis System
+# Configuration File
+# ============================================================
+
+system:
+  name: "INLAAS - Intelligent Network Log Automation & Analysis System"
+  version: "1.0.0"
+  environment: "development"   # development | staging | production
+  log_level: "INFO"            # DEBUG | INFO | WARNING | ERROR | CRITICAL
+
+# ─── Collection Settings ────────────────────────────────────
+collection:
+  poll_interval_seconds: 30
+  batch_size: 500
+  max_retries: 3
+  timeout_seconds: 10
+  supported_platforms:
+    - syslog
+    - snmp
+    - netconf
+    - restconf
+    - api
+
+  # Network Management System integrations
+  nms_integrations:
+    solarwinds:
+      enabled: false
+      base_url: "http://solarwinds-nms:17778/SolarWinds/InformationService/v3/Json"
+      username: "${SOLARWINDS_USER}"
+      password: "${SOLARWINDS_PASS}"
+    prtg:
+      enabled: false
+      base_url: "https://prtg-server/api"
+      api_key: "${PRTG_API_KEY}"
+    nagios:
+      enabled: false
+      base_url: "http://nagios-server/nagios/cgi-bin"
+      username: "${NAGIOS_USER}"
+      password: "${NAGIOS_PASS}"
+    zabbix:
+      enabled: false
+      base_url: "http://zabbix-server/zabbix/api_jsonrpc.php"
+      username: "${ZABBIX_USER}"
+      password: "${ZABBIX_PASS}"
+
+# ─── Database Settings ──────────────────────────────────────
+database:
+  type: "sqlite"               # sqlite | postgresql | mysql
+  sqlite:
+    path: "data/network_logs.db"
+  postgresql:
+    host: "${DB_HOST:-localhost}"
+    port: 5432
+    name: "${DB_NAME:-network_logs}"
+    username: "${DB_USER}"
+    password: "${DB_PASS}"
+    pool_size: 10
+
+# ─── ML Model Settings ──────────────────────────────────────
+ml:
+  classifier:
+    algorithm: "random_forest"  # random_forest | gradient_boosting | svm
+    n_estimators: 100
+    max_depth: 10
+    min_samples_split: 5
+    model_path: "models/log_classifier.pkl"
+    retrain_threshold: 500       # Retrain after N new labeled samples
+
+  anomaly_detection:
+    algorithm: "isolation_forest"  # isolation_forest | local_outlier_factor | autoencoder
+    contamination: 0.05            # Expected fraction of anomalies
+    n_estimators: 100
+    model_path: "models/anomaly_detector.pkl"
+    window_size: 100               # Rolling window for baseline calculation
+
+  pattern_recognition:
+    min_pattern_frequency: 3       # Minimum occurrences to consider a pattern
+    time_window_minutes: 60
+    similarity_threshold: 0.75
+
+  predictive_maintenance:
+    prediction_horizon_hours: 24   # How far ahead to predict failures
+    confidence_threshold: 0.70     # Minimum confidence for alerts
+    model_path: "models/predictive_model.pkl"
+    features:
+      - cpu_usage
+      - memory_usage
+      - interface_errors
+      - error_frequency
+      - warning_rate
+
+# ─── Alert Thresholds ───────────────────────────────────────
+thresholds:
+  cpu_usage_warning: 75
+  cpu_usage_critical: 90
+  memory_usage_warning: 80
+  memory_usage_critical: 92
+  interface_error_warning: 10
+  interface_error_critical: 50
+  anomaly_score_alert: 0.65
+  security_threat_score: 0.80
+
+# ─── API Server Settings ────────────────────────────────────
+api:
+  host: "0.0.0.0"
+  port: 8000
+  debug: false
+  reload: false
+  workers: 4
+  cors_origins:
+    - "http://localhost:3000"
+    - "http://localhost:8080"
+  rate_limit:
+    requests_per_minute: 100
+    burst: 20
+  auth:
+    enabled: true
+    secret_key: "${API_SECRET_KEY:-dev-secret-change-in-production}"
+    token_expiry_hours: 24
+
+# ─── Dashboard Settings ─────────────────────────────────────
+dashboard:
+  refresh_interval_seconds: 30
+  retention_days: 90
+  report_formats:
+    - json
+    - html
+    - pdf
+  email_notifications:
+    enabled: false
+    smtp_host: "${SMTP_HOST}"
+    smtp_port: 587
+    sender: "${EMAIL_SENDER}"
+    recipients:
+      - "${EMAIL_RECIPIENT}"
+
+# ─── Security Settings ──────────────────────────────────────
+security:
+  threat_categories:
+    - port_scan
+    - brute_force
+    - dos_attack
+    - ddos_attack
+    - dns_amplification
+    - arp_spoofing
+    - unauthorized_access
+    - data_exfiltration
+  auto_block_threats: false   # Set true only in production with firewall API
+  threat_intelligence_feed: false
