@@ -308,3 +308,158 @@ class MLLogClassifier:
         importance = dict(zip(feat_keys, self.model.feature_importances_))
         return dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
 
+
+# ─── Full Classification Pipeline ────────────────────────────────────────────
+
+class LogClassificationPipeline:
+    """
+    End-to-end pipeline: takes RawLog → ClassifiedLog.
+    Handles component extraction, version parsing, threat detection,
+    and recommended action generation.
+    """
+
+    def __init__(self, config: Optional[Dict] = None):
+        cfg = config or {}
+        self.ml_classifier = MLLogClassifier(
+            model_path=cfg.get("model_path", "models/log_classifier.pkl"),
+            confidence_threshold=cfg.get("confidence_threshold", 0.65),
+        )
+        self.feature_engineer = LogFeatureEngineer()
+        self.rule_classifier = RuleBasedClassifier()
+
+    def _extract_components(self, log: RawLog) -> List[str]:
+        """Parse impacted components from raw log text."""
+        text = f"{log.description} {log.raw_message}"
+        components = []
+
+        # Named interfaces
+        iface_matches = re.findall(
+            r"(?:GigabitEthernet|TenGigE|FastEthernet|Ethernet|Port-channel|Vlan)"
+            r"[\d/]+",
+            text, re.IGNORECASE
+        )
+        components.extend(set(iface_matches))
+
+        # IP addresses
+        ip_matches = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text)
+        components.extend(set(ip_matches[:3]))  # Limit to 3 IPs
+
+        # Protocol / service names
+        for comp in LogFeatureEngineer.COMPONENT_KEYWORDS:
+            if any(kw in text.lower() for kw in LogFeatureEngineer.COMPONENT_KEYWORDS[comp]):
+                if comp not in components:
+                    components.append(comp)
+
+        return components[:10]  # Cap at 10
+
+    def _extract_version(self, log: RawLog) -> str:
+        """Extract OS/firmware version strings from the log."""
+        if log.version:
+            return log.version
+        text = f"{log.description} {log.raw_message}"
+        patterns = [
+            r"IOS-XE\s[\d\.]+",
+            r"NX-OS\s[\d\.]+",
+            r"IOS\s[\d\.]+",
+            r"ASA\s[\d\.]+",
+            r"v[\d]+\.[\d]+\.[\d]+",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                return m.group(0)
+        return "Unknown"
+
+    def _detect_threat(self, log: RawLog, category: str) -> Tuple[bool, str, float]:
+        """Return (is_threat, threat_type, threat_score)."""
+        if category != "SECURITY":
+            return False, "", 0.0
+
+        text = f"{log.description} {log.raw_message}".lower()
+        best_threat, best_score = "", 0.0
+
+        for threat, pattern in LogFeatureEngineer.THREAT_PATTERNS.items():
+            if pattern.search(text):
+                # Base threat score from severity
+                sev_scores = {"CRITICAL": 0.95, "ERROR": 0.80,
+                              "WARNING": 0.65, "INFO": 0.40}
+                score = sev_scores.get(log.severity.upper(), 0.60)
+                # Boost for high resource usage
+                if (log.metrics or {}).get("cpu_usage", 0) > 80:
+                    score = min(score + 0.05, 1.0)
+                if score > best_score:
+                    best_score = score
+                    best_threat = threat
+
+        return bool(best_threat), best_threat, best_score
+
+    def _get_action(self, category: str, subcategory: str,
+                     severity: str, threat_type: str) -> str:
+        """Map category + severity to a human-readable recommended action."""
+        if threat_type:
+            actions = {
+                "port_scan":        "🔒 Block source IP immediately. Review ACLs and enable IPS.",
+                "brute_force":      "🔒 Lockout source IP. Enforce MFA. Alert security team.",
+                "dos_attack":       "🔒 Activate DDoS mitigation. Rate-limit traffic from source.",
+                "dns_amplification":"🔒 Restrict DNS ANY queries. Implement DNS rate limiting.",
+                "unauthorized":     "🔒 Audit privilege escalation attempts. Rotate credentials.",
+            }
+            return actions.get(threat_type, "🔒 Investigate and contain the security incident.")
+
+        action_map = {
+            "BGP":       "Verify BGP peer reachability and check routing table integrity.",
+            "OSPF":      "Check OSPF hello intervals, authentication, and MTU mismatches.",
+            "STP":       "Investigate topology change: look for rogue switches or BPDU storms.",
+            "INTERFACE": "Check physical: cable integrity, SFP module, and remote port state.",
+            "HARDWARE":  {
+                "high_cpu":    "Identify top processes (show proc cpu); consider process restart.",
+                "high_memory": "Identify memory consumers; plan maintenance window for reload.",
+            },
+            "QOS":       "Review QoS policies; increase bandwidth allocation for critical queues.",
+            "DNS":       "Inspect DNS server logs; check for misconfigurations or attacks.",
+            "VPN":       "Check IKE proposals, PSK/certificates, and IP routing to peer.",
+            "GENERAL":   "Log recorded for baseline; no immediate action required.",
+        }
+        result = action_map.get(category, "Review log details and consult network runbook.")
+        if isinstance(result, dict):
+            result = result.get(subcategory, f"Investigate {category} issue.")
+        return result
+
+    def classify(self, log: RawLog) -> ClassifiedLog:
+        """Transform a RawLog into a fully classified ClassifiedLog."""
+        category, confidence, method = self.ml_classifier.predict(log)
+        _, subcategory, _, _ = self.rule_classifier.classify(log)
+
+        components = self._extract_components(log)
+        version = self._extract_version(log)
+        is_threat, threat_type, threat_score = self._detect_threat(log, category)
+        action = self._get_action(category, subcategory, log.severity, threat_type)
+
+        return ClassifiedLog(
+            log_id=log.log_id,
+            timestamp=log.timestamp,
+            source=log.source,
+            source_ip=log.source_ip,
+            platform=log.platform,
+            raw_message=log.raw_message,
+            description=log.description,
+            metrics=log.metrics,
+            category=category,
+            subcategory=subcategory,
+            severity=log.severity,
+            impacted_components=components,
+            version=version,
+            classification_confidence=round(confidence, 3),
+            classification_method=method,
+            is_anomaly=False,     # Set by AnomalyDetector later
+            anomaly_score=0.0,
+            security_threat=is_threat,
+            threat_type=threat_type,
+            threat_score=round(threat_score, 3),
+            recommended_action=action,
+            tags=log.tags,
+        )
+
+    def classify_batch(self, logs: List[RawLog]) -> List[ClassifiedLog]:
+        """Classify a list of logs, returning ClassifiedLog objects."""
+        return [self.classify(log) for log in logs]
