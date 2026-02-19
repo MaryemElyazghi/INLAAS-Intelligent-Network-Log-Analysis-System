@@ -143,3 +143,139 @@ class SyslogCollector:
             self._server.shutdown()
             logger.info("SyslogCollector stopped.")
 
+
+# ─── REST / NMS Collector ────────────────────────────────────────────────────
+
+class NMSCollector:
+    """
+    Polls Network Management System REST APIs to collect logs and events.
+    Currently supports: SolarWinds, PRTG, Nagios, Zabbix, and generic REST.
+    """
+
+    def __init__(self, config: Dict):
+        self.config = config
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
+
+    # ── Generic REST ─────────────────────────────────────────
+    def collect_from_rest(self, base_url: str, endpoint: str,
+                          headers: Optional[Dict] = None,
+                          params: Optional[Dict] = None) -> List[RawLog]:
+        """Pull logs from a generic REST API endpoint."""
+        try:
+            resp = self.session.get(
+                f"{base_url}/{endpoint.lstrip('/')}",
+                headers=headers or {},
+                params=params or {},
+                timeout=self.config.get("timeout_seconds", 10),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return self._normalize_rest_response(data, base_url)
+        except requests.RequestException as exc:
+            logger.error("REST collection failed for %s: %s", base_url, exc)
+            return []
+
+    def _normalize_rest_response(self, data: Any, source: str) -> List[RawLog]:
+        logs = []
+        items = data if isinstance(data, list) else data.get("results", data.get("logs", []))
+        for item in items[:self.config.get("batch_size", 500)]:
+            logs.append(RawLog(
+                source=item.get("source", source),
+                platform="api",
+                component=item.get("component", "UNKNOWN"),
+                version=item.get("version", ""),
+                severity=item.get("severity", "INFO").upper(),
+                description=item.get("description", item.get("message", "")),
+                raw_message=json.dumps(item),
+                metrics=item.get("metrics", {}),
+            ))
+        return logs
+
+    # ── SolarWinds SWIS ──────────────────────────────────────
+    def collect_from_solarwinds(self, base_url: str,
+                                 username: str, password: str) -> List[RawLog]:
+        """Query SolarWinds Information Service (SWIS) for network events."""
+        query = {
+            "query": (
+                "SELECT EventTime, NetObjectID, NetObjectType, Message, "
+                "Acknowledged, EngineID "
+                "FROM Orion.Events "
+                "WHERE EventTime > GETDATE()-1 "
+                "ORDER BY EventTime DESC"
+            )
+        }
+        try:
+            resp = self.session.post(
+                f"{base_url}/Query",
+                json=query,
+                auth=(username, password),
+                verify=False,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+            return [
+                RawLog(
+                    timestamp=r.get("EventTime", datetime.now(timezone.utc).isoformat()),
+                    source=str(r.get("NetObjectID", "")),
+                    platform="nms_solarwinds",
+                    component=r.get("NetObjectType", "UNKNOWN"),
+                    description=r.get("Message", ""),
+                    raw_message=json.dumps(r),
+                )
+                for r in results
+            ]
+        except requests.RequestException as exc:
+            logger.error("SolarWinds collection failed: %s", exc)
+            return []
+
+    # ── Zabbix ───────────────────────────────────────────────
+    def collect_from_zabbix(self, base_url: str,
+                             username: str, password: str) -> List[RawLog]:
+        """Authenticate and pull events from Zabbix API."""
+        try:
+            # Authenticate
+            auth_resp = self.session.post(base_url, json={
+                "jsonrpc": "2.0", "method": "user.login",
+                "params": {"username": username, "password": password},
+                "id": 1,
+            })
+            token = auth_resp.json().get("result", "")
+
+            # Get events
+            events_resp = self.session.post(base_url, json={
+                "jsonrpc": "2.0", "method": "event.get",
+                "params": {
+                    "output": "extend",
+                    "select_hosts": ["host"],
+                    "limit": self.config.get("batch_size", 500),
+                    "sortfield": ["clock"],
+                    "sortorder": "DESC",
+                },
+                "auth": token, "id": 2,
+            })
+            events = events_resp.json().get("result", [])
+            return [
+                RawLog(
+                    timestamp=datetime.fromtimestamp(
+                        int(e.get("clock", 0)), timezone.utc
+                    ).isoformat(),
+                    source=e.get("hosts", [{}])[0].get("host", "unknown"),
+                    platform="nms_zabbix",
+                    severity=self._zabbix_severity(int(e.get("severity", 0))),
+                    description=e.get("name", ""),
+                    raw_message=json.dumps(e),
+                )
+                for e in events
+            ]
+        except requests.RequestException as exc:
+            logger.error("Zabbix collection failed: %s", exc)
+            return []
+
+    @staticmethod
+    def _zabbix_severity(sev: int) -> str:
+        mapping = {0: "INFO", 1: "INFO", 2: "WARNING",
+                   3: "ERROR", 4: "ERROR", 5: "CRITICAL"}
+        return mapping.get(sev, "INFO")
+
