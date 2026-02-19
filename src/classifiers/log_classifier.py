@@ -187,3 +187,124 @@ class RuleBasedClassifier:
         return "GENERAL", "informational", 0.50, "No immediate action required"
 
 
+# ─── ML-Based Classifier ─────────────────────────────────────────────────────
+
+class MLLogClassifier:
+    """
+    Random Forest classifier that learns to categorize network logs.
+    Falls back to rule-based classifier when confidence is below threshold.
+    """
+
+    def __init__(self, model_path: str = "models/log_classifier.pkl",
+                 confidence_threshold: float = 0.65):
+        self.model_path = model_path
+        self.confidence_threshold = confidence_threshold
+        self.feature_engineer = LogFeatureEngineer()
+        self.rule_classifier = RuleBasedClassifier()
+        self.model: Optional[RandomForestClassifier] = None
+        self.label_encoder = LabelEncoder()
+        self.is_trained = False
+        self._load_model()
+
+    def _load_model(self):
+        if os.path.exists(self.model_path):
+            try:
+                saved = joblib.load(self.model_path)
+                self.model = saved["model"]
+                self.label_encoder = saved["label_encoder"]
+                self.is_trained = True
+                logger.info("ML classifier loaded from %s", self.model_path)
+            except Exception as exc:
+                logger.warning("Could not load model: %s. Will use rule-based classifier.", exc)
+
+    def _save_model(self):
+        os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
+        joblib.dump({"model": self.model, "label_encoder": self.label_encoder},
+                    self.model_path)
+        logger.info("ML classifier saved to %s", self.model_path)
+
+    def train(self, logs: List[RawLog], labels: List[str]) -> Dict:
+        """
+        Train (or retrain) the classifier on labeled examples.
+
+        Args:
+            logs:   List of RawLog objects
+            labels: Ground-truth category labels (must align with logs)
+
+        Returns:
+            Dict with accuracy, cross-val scores, and full classification report
+        """
+        if len(logs) < 20:
+            raise ValueError("Need at least 20 labeled examples to train.")
+
+        logger.info("Training ML classifier on %d examples...", len(logs))
+
+        X = np.array([self.feature_engineer.features_to_array(
+            self.feature_engineer.extract_features(log)) for log in logs])
+        y_enc = self.label_encoder.fit_transform(labels)
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y_enc, test_size=0.2, random_state=42, stratify=y_enc
+        )
+
+        self.model = RandomForestClassifier(
+            n_estimators=100, max_depth=10, min_samples_split=5,
+            class_weight="balanced", random_state=42, n_jobs=-1
+        )
+        self.model.fit(X_train, y_train)
+
+        y_pred = self.model.predict(X_test)
+        acc = accuracy_score(y_test, y_pred)
+        cv_scores = cross_val_score(self.model, X, y_enc, cv=5)
+        report = classification_report(
+            y_test, y_pred,
+            target_names=self.label_encoder.classes_,
+            output_dict=True,
+        )
+
+        self.is_trained = True
+        self._save_model()
+
+        logger.info("Training complete. Accuracy: %.3f | CV mean: %.3f±%.3f",
+                    acc, cv_scores.mean(), cv_scores.std())
+
+        return {
+            "accuracy": acc,
+            "cv_mean": cv_scores.mean(),
+            "cv_std": cv_scores.std(),
+            "report": report,
+            "n_samples": len(logs),
+            "classes": list(self.label_encoder.classes_),
+        }
+
+    def predict(self, log: RawLog) -> Tuple[str, float, str]:
+        """
+        Returns (category, confidence, method) for a single log.
+        Uses ML if trained and confident; otherwise falls back to rules.
+        """
+        features = self.feature_engineer.extract_features(log)
+        feat_arr = self.feature_engineer.features_to_array(features).reshape(1, -1)
+
+        if self.is_trained and self.model is not None:
+            probs = self.model.predict_proba(feat_arr)[0]
+            best_idx = np.argmax(probs)
+            confidence = float(probs[best_idx])
+            category = self.label_encoder.inverse_transform([best_idx])[0]
+
+            if confidence >= self.confidence_threshold:
+                return category, confidence, "ml"
+
+        # Fallback to rule-based
+        category, _, confidence, _ = self.rule_classifier.classify(log)
+        return category, confidence, "rule"
+
+    def get_feature_importance(self) -> Optional[Dict[str, float]]:
+        """Return feature importance scores if model is trained."""
+        if not self.is_trained or self.model is None:
+            return None
+        eng = LogFeatureEngineer()
+        dummy = RawLog()
+        feat_keys = sorted(eng.extract_features(dummy).keys())
+        importance = dict(zip(feat_keys, self.model.feature_importances_))
+        return dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
+
