@@ -279,3 +279,113 @@ class NMSCollector:
                    3: "ERROR", 4: "ERROR", 5: "CRITICAL"}
         return mapping.get(sev, "INFO")
 
+
+
+# ─── File / Batch Collector ──────────────────────────────────────────────────
+
+class FileLogCollector:
+    """
+    Reads and parses log files (JSON, plain-text syslog, CSV).
+    Useful for batch ingestion of historical logs or offline analysis.
+    """
+
+    def collect_from_json(self, filepath: str) -> List[RawLog]:
+        """Load logs from a JSON file (list of log dicts)."""
+        with open(filepath, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+
+        logs = []
+        for item in data:
+            logs.append(RawLog(
+                log_id=item.get("log_id", f"LOG-{uuid4().hex[:8].upper()}"),
+                timestamp=item.get("timestamp", datetime.now(timezone.utc).isoformat()),
+                source=item.get("source", ""),
+                platform=item.get("platform", "file"),
+                component=item.get("component", "UNKNOWN"),
+                version=item.get("version", ""),
+                severity=item.get("severity", "INFO").upper(),
+                description=item.get("description", ""),
+                raw_message=item.get("raw_message", json.dumps(item)),
+                metrics=item.get("metrics", {}),
+            ))
+        logger.info("Loaded %d logs from %s", len(logs), filepath)
+        return logs
+
+    def collect_from_syslog_file(self, filepath: str) -> List[RawLog]:
+        """Parse a plain-text syslog file line by line."""
+        handler = SyslogHandler.__new__(SyslogHandler)
+        logs = []
+        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    logs.append(handler._parse_syslog(line, "file"))
+        logger.info("Parsed %d lines from syslog file %s", len(logs), filepath)
+        return logs
+
+# ─── Orchestrator ────────────────────────────────────────────────────────────
+
+class LogCollectionOrchestrator:
+    """
+    Central coordinator that manages multiple collectors and provides a unified
+    interface for log ingestion from all configured sources.
+    """
+
+    def __init__(self, config: Dict):
+        self.config = config
+        self.file_collector = FileLogCollector()
+        self.nms_collector = NMSCollector(config.get("collection", {}))
+        self._syslog_collector: Optional[SyslogCollector] = None
+        self._callbacks: List[Callable[[List[RawLog]], None]] = []
+        self._buffer: List[RawLog] = []
+        self._lock = threading.Lock()
+
+    def register_callback(self, cb: Callable[[List[RawLog]], None]):
+        """Register a function to be called when new logs arrive."""
+        self._callbacks.append(cb)
+
+    def _dispatch(self, logs: List[RawLog]):
+        with self._lock:
+            self._buffer.extend(logs)
+        for cb in self._callbacks:
+            try:
+                cb(logs)
+            except Exception as exc:
+                logger.error("Callback error: %s", exc)
+
+    def start_syslog_listener(self, host: str = "0.0.0.0", port: int = 514):
+        def _cb(log: RawLog):
+            self._dispatch([log])
+        self._syslog_collector = SyslogCollector(host, port, callback=_cb)
+        self._syslog_collector.start()
+
+    def ingest_file(self, filepath: str) -> List[RawLog]:
+        """Ingest a JSON or plain-text log file."""
+        if filepath.endswith(".json"):
+            logs = self.file_collector.collect_from_json(filepath)
+        else:
+            logs = self.file_collector.collect_from_syslog_file(filepath)
+        self._dispatch(logs)
+        return logs
+
+    def poll_nms(self, platform: str, **kwargs) -> List[RawLog]:
+        """Manually trigger a NMS poll."""
+        logs: List[RawLog] = []
+        if platform == "solarwinds":
+            logs = self.nms_collector.collect_from_solarwinds(**kwargs)
+        elif platform == "zabbix":
+            logs = self.nms_collector.collect_from_zabbix(**kwargs)
+        elif platform == "rest":
+            logs = self.nms_collector.collect_from_rest(**kwargs)
+        self._dispatch(logs)
+        return logs
+
+    def flush_buffer(self) -> List[RawLog]:
+        """Return and clear accumulated logs."""
+        with self._lock:
+            logs, self._buffer = self._buffer, []
+        return logs
+
+    def stop(self):
+        if self._syslog_collector:
+            self._syslog_collector.stop()
